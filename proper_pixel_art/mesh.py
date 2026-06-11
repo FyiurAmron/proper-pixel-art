@@ -143,6 +143,82 @@ def homogenize_lines(lines: Lines, pixel_width: int) -> Lines:
     return complete_lines
 
 
+def compute_edge_map(
+    img: Image.Image,
+    mesh_config: MeshConfig | None = None,
+) -> np.ndarray:
+    """
+    Compute a closed edge map from an image.
+    Crops border, clamps alpha, runs Canny edge detection, and applies
+    morphological closing to fill small gaps.
+
+    Args:
+        img: RGBA PIL image
+        mesh_config: Tunable mesh-detection parameters (Canny, closing, ...)
+
+    Returns:
+        Binary edge map as numpy array (uint8, values 0 or 255)
+    """
+    mesh_config = mesh_config or MeshConfig()
+    # Crop border and zero out mostly transparent pixels from alpha.
+    # The grayscale clamp here only suppresses transparent-edge noise before edge
+    # detection, so it intentionally uses the default alpha threshold rather than
+    # color_config.alpha_threshold (which governs the final downsample step).
+    cropped_img = utils.crop_border(img, num_pixels=mesh_config.crop_border_pixels)
+    grey_img = colors.clamp_alpha(cropped_img, mode="L")
+    edges = cv2.Canny(np.array(grey_img), *mesh_config.canny_thresholds)
+    closed_edges = close_edges(edges, kernel_size=mesh_config.closure_kernel_size)
+    return closed_edges
+
+
+def compute_mesh_from_edges(
+    closed_edges: np.ndarray,
+    pixel_width: int | None = None,
+    output_dir: Path | None = None,
+    original_img: Image.Image | None = None,
+    mesh_config: MeshConfig | None = None,
+) -> Mesh:
+    """
+    Compute mesh from a closed edge map using Hough transform and line homogenization.
+
+    Args:
+        closed_edges: Binary edge map (uint8, values 0 or 255)
+        pixel_width: If set, skips automatic pixel width detection
+        output_dir: If set, saves debug images (requires original_img)
+        original_img: Original image for debug visualization overlays
+        mesh_config: Tunable mesh-detection parameters (Hough, clustering, ...)
+
+    Returns:
+        The pixel mesh (mesh_x, mesh_y)
+    """
+    mesh_config = mesh_config or MeshConfig()
+    mesh_initial = detect_grid_lines(closed_edges, mesh_config)
+
+    if pixel_width is None:
+        pixel_width = get_pixel_width(
+            mesh_initial, trim_outlier_fraction=mesh_config.trim_outlier_fraction
+        )
+
+    lines_x, lines_y = mesh_initial
+    mesh_x = homogenize_lines(lines_x, pixel_width)
+    mesh_y = homogenize_lines(lines_y, pixel_width)
+    mesh_final = mesh_x, mesh_y
+
+    if output_dir is not None:
+        edges_img = Image.fromarray(closed_edges, mode="L")
+        edges_img.save(output_dir / "closed_edges.png")
+
+        if original_img is not None:
+            img_with_lines = utils.overlay_grid_lines(original_img, mesh_initial)
+            img_with_lines.save(output_dir / "lines.png")
+            img_with_completed_lines = utils.overlay_grid_lines(
+                original_img, mesh_final
+            )
+            img_with_completed_lines.save(output_dir / "mesh.png")
+
+    return mesh_final
+
+
 def compute_mesh(
     img: Image.Image,
     output_dir: Path | None = None,
@@ -171,46 +247,23 @@ def compute_mesh(
     have been distorted via linear transformation.
     """
     mesh_config = mesh_config or MeshConfig()
-    # Crop border and zero out mostly transparent pixels from alpha.
-    # The grayscale clamp here only suppresses transparent-edge noise before edge
-    # detection, so it intentionally uses the default alpha threshold rather than
-    # color_config.alpha_threshold (which governs the final downsample step).
-    cropped_img = utils.crop_border(img, num_pixels=mesh_config.crop_border_pixels)
-    grey_img = colors.clamp_alpha(cropped_img, mode="L")
+    closed_edges = compute_edge_map(img, mesh_config=mesh_config)
 
-    # Find edges using Canny edge detection
-    edges = cv2.Canny(np.array(grey_img), *mesh_config.canny_thresholds)
-
-    # Close small gaps in edges with morphological closing
-    closed_edges = close_edges(edges, kernel_size=mesh_config.closure_kernel_size)
-
-    # Use Hough transform to get an initial estimate for pixel lines
-    mesh_initial = detect_grid_lines(closed_edges, mesh_config)
-
-    if pixel_width is None:
-        # Get the true width of the pixels if a value hasn't been provided
-        pixel_width = get_pixel_width(
-            mesh_initial, trim_outlier_fraction=mesh_config.trim_outlier_fraction
-        )
-
-    # Fill in the gaps between the lines to complete the grid
-    lines_x, lines_y = mesh_initial
-    mesh_x = homogenize_lines(lines_x, pixel_width)
-    mesh_y = homogenize_lines(lines_y, pixel_width)
-    mesh_final = mesh_x, mesh_y
-
+    # Save raw edges debug image (before closing) if output_dir is set
     if output_dir is not None:
+        cropped_img = utils.crop_border(img, num_pixels=mesh_config.crop_border_pixels)
+        grey_img = colors.clamp_alpha(cropped_img, mode="L")
+        edges = cv2.Canny(np.array(grey_img), *mesh_config.canny_thresholds)
         edges_img = Image.fromarray(edges, mode="L")
         edges_img.save(output_dir / "edges.png")
-        closed_edges_img = Image.fromarray(closed_edges, mode="L")
-        closed_edges_img.save(output_dir / "closed_edges.png")
 
-        img_with_lines = utils.overlay_grid_lines(img, mesh_initial)
-        img_with_lines.save(output_dir / "lines.png")
-        img_with_completed_lines = utils.overlay_grid_lines(img, mesh_final)
-        img_with_completed_lines.save(output_dir / "mesh.png")
-
-    return mesh_final
+    return compute_mesh_from_edges(
+        closed_edges,
+        pixel_width=pixel_width,
+        output_dir=output_dir,
+        original_img=img,
+        mesh_config=mesh_config,
+    )
 
 
 def compute_mesh_with_scaling(
@@ -234,7 +287,7 @@ def compute_mesh_with_scaling(
         pixel_width=pixel_width,
         mesh_config=mesh_config,
     )
-    if not _is_trivial_mesh(mesh_lines):
+    if not is_trivial_mesh(mesh_lines):
         return mesh_lines, upscale_factor
 
     # If no mesh is found, then use the original image instead.
@@ -244,7 +297,7 @@ def compute_mesh_with_scaling(
     return fallback_mesh_lines, 1
 
 
-def _is_trivial_mesh(img_mesh: Mesh) -> bool:
+def is_trivial_mesh(img_mesh: Mesh) -> bool:
     """
     Returns True if no lines have been identified when computing the mesh.
     That is, the points in mesh_x and mesh_y consist of the left, right, and top, bottom
