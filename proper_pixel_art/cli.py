@@ -123,9 +123,6 @@ def main() -> None:
     args = parse_args()
     input_path = Path(args.input_path).expanduser()
 
-    out_path = resolve_output_path(Path(args.out_path), input_path)
-    out_path.parent.mkdir(exist_ok=True, parents=True)
-
     img = Image.open(input_path)
     pixelated = pixelate.pixelate(
         img,
@@ -135,6 +132,11 @@ def main() -> None:
         pixel_width=args.pixel_width,
         initial_upscale_factor=args.initial_upscale,
     )
+
+    width, height = pixelated .size
+
+    out_path = resolve_output_path(Path(args.out_path), input_path, f"_{width}x{height}")
+    out_path.parent.mkdir(exist_ok=True, parents=True)
 
     pixelated.save(out_path)
 
